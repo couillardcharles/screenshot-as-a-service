@@ -71,6 +71,7 @@ service = server.listen(port, function(request, response) {
   var forwardCacheHeaders = request.headers.forwardCacheHeaders;
   var retina = request.headers.retina;
   var clipSelector = request.headers.clipSelector;
+  var waitForResources = true;
   var clipRect;
   if (request.headers.clipRect) {
     clipRect = JSON.parse(request.headers.clipRect);
@@ -93,16 +94,61 @@ service = server.listen(port, function(request, response) {
     return response.close();
   }
 
+  var onResourceRequested = [],
+      onResourceReceived = [],
+      onResourceTimeout = [];
+
+  var resourcesReady = function () {
+    return true;
+  };
+  if (waitForResources) {
+    (function () {
+      var pendingResources = {};
+      onResourceRequested.push(function (requestData, networkRequest) {
+        pendingResources[requestData.id] = requestData.id;
+      });
+      onResourceReceived.push(function (response) {
+        if (response.stage === 'end') {
+          delete pendingResources[response.id];
+        }
+      });
+      onResourceTimeout.push(function (request) {
+        delete pendingResources[request.id];
+      });
+      resourcesReady = function () {
+        return Object.getOwnPropertyNames(pendingResources).length === 0;
+      };
+    })();
+  }
+  
   if (forwardCacheHeaders) {
     var cacheHeaders = /cache-control|expires|etag|vary|pragma/i;
-    page.onResourceReceived = function(resource) {
-      if (resource.url === url && resource.status === 200) {
-        page.cacheHeaders = resource.headers.filter(function (header) {
+    onResourceReceived.push(function(response) {
+      if (response.url === url && response.status === 200) {
+        page.cacheHeaders = response.headers.filter(function (header) {
           return header.name.match(cacheHeaders);
         });
       }
-    };
+    });
   }
+
+  page.onResourceRequested = function (requestData, networkRequest) {
+    onResourceRequested.forEach(function (fun) {
+      fun(requestData, networkRequest);
+    });
+  };
+
+  page.onResourceReceived = function (response) {
+    onResourceReceived.forEach(function (fun) {
+      fun(response);
+    });
+  };
+
+  page.onResourceTimeout = function (request) {
+    onResourceRequested.forEach(function (fun) {
+      fun(request);
+    });
+  };
 
   page.open(url, function(status) {
 
@@ -151,7 +197,7 @@ service = server.listen(port, function(request, response) {
       var isReady = page.evaluate(function (expression) {
         return eval(expression);
       }, readyExpression);
-      if (isReady || --watchdog <= 0) {
+      if (isReady && resourcesReady() || --watchdog <= 0) {
         onReady();
       } else {
         setTimeout(waitForReady, 100);
